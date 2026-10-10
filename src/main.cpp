@@ -185,6 +185,7 @@ namespace fw {
         int range = 12;
         int savedAttempts = 0;
         bool aborted = false;
+        bool lateInject = false;   // a click was injected after its tick had passed
         std::string error;
     };
     inline Scan S;
@@ -367,6 +368,19 @@ namespace fw {
             inStep = false;
             int tick = pl->m_gameState.m_currentProgress;
 
+            if (tick - before > 1) {
+                S.error = fmt::format("The game advanced {} ticks in one step, so click timing would be unreliable. "
+                                      "The step logic needs adjusting for this game version.", tick - before);
+                endScan(pl, false);
+                return;
+            }
+            if (S.lateInject) {
+                S.error = "A click was injected after its tick had already passed, so results would be unreliable. "
+                          "Check kTickOffset and where processCommands is called.";
+                endScan(pl, false);
+                return;
+            }
+
             if (tick == before) {
                 if (++S.noProgress > 8) {
                     S.error = "The game did not advance a physics tick. This game version needs a tweak in scanTick.";
@@ -441,6 +455,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
 
             while (idx < ev.size() && ev[idx].tick <= tick) {
                 auto c = ev[idx];
+                if (scanning && c.tick < tick) fw::S.lateInject = true;
                 fw::injecting = true;
                 GJBaseGameLayer::handleButton(c.down, c.button, c.p1);
                 fw::injecting = false;
