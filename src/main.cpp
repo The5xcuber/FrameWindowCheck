@@ -445,7 +445,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = typeinfo_cast<PlayLayer*>(this);
         if (pl && (fw::mode == fw::Mode::Replaying || fw::mode == fw::Mode::Scanning)) {
             bool scanning = fw::mode == fw::Mode::Scanning;
@@ -463,7 +463,7 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
                 idx++;
             }
         }
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
