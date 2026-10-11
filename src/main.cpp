@@ -204,6 +204,7 @@ namespace fw {
         bool aborted = false;
         bool cancel = false;
         bool lateInject = false;       // a click was injected after its tick had passed
+        bool everRan = false;          // scanTick has run at least once (proves the update hook fires)
         std::string error;
     };
     inline Scan S;
@@ -415,6 +416,17 @@ namespace fw {
         scene->addChild(hud, 9999);
     }
 
+    // Stops a scan without touching the level (safe to call from inside a game update).
+    inline void abortScanFromHook(char const* message) {
+        auto pl = PlayLayer::get();
+        mode = Mode::Idle;
+        inStep = false;
+        removeProgress();
+        dropSnap();
+        if (pl) pl->m_attempts = S.savedAttempts;
+        FLAlertLayer::create("Scan stopped", message, "OK")->show();
+    }
+
     inline void endScan(PlayLayer* pl, bool ok) {
         mode = Mode::Idle;
         inStep = false;
@@ -474,6 +486,7 @@ namespace fw {
     }
 
     inline void scanTick(PlayLayer* pl) {
+        S.everRan = true;
         auto start = std::chrono::steady_clock::now();
         auto budget = std::chrono::milliseconds(opt<int64_t>("scan-budget-ms"));
 
@@ -664,8 +677,24 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
+    // PlayLayer does not declare update, GJBaseGameLayer does. A hook on PlayLayer::update
+    // compiles but never fires, so the scan loop has to live here.
+    void update(float dt) {
+        auto pl = typeinfo_cast<PlayLayer*>(this);
+        if (pl && fw::mode == fw::Mode::Scanning && !fw::inStep) {
+            fw::scanTick(pl);
+            return;
+        }
+        GJBaseGameLayer::update(dt);
+    }
+
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = typeinfo_cast<PlayLayer*>(this);
+        if (pl && fw::mode == fw::Mode::Scanning && !fw::inStep && !fw::S.everRan) {
+            // The game is running by itself while a scan is active, so the scan loop is not
+            // in control. Stop instead of letting a "scan" play the level for real.
+            fw::abortScanFromHook("The scan loop was not driving the game (the update hook did not fire). Scan stopped.");
+        }
         if (pl && fw::mode == fw::Mode::Recording) {
             fw::lastSeenTick = m_gameState.m_currentProgress;
         }
@@ -717,14 +746,6 @@ class $modify(FWPlayLayer, PlayLayer) {
     void loadFromCheckpoint(CheckpointObject* cp) {
         PlayLayer::loadFromCheckpoint(cp);
         fw::rewindRecording(this);
-    }
-
-    void update(float dt) {
-        if (fw::mode == fw::Mode::Scanning && !fw::inStep) {
-            fw::scanTick(this);
-            return;
-        }
-        PlayLayer::update(dt);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
