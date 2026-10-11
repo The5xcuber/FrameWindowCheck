@@ -858,10 +858,10 @@ public:
         return nullptr;
     }
 
-    void onRecord(CCObject*)  { if (fw::actionRecord(m_pause))  this->onClose(); }
-    void onReplay(CCObject*)  { if (fw::actionReplay(m_pause))  this->onClose(); }
-    void onAnalyze(CCObject*) { if (fw::actionAnalyze(m_pause)) this->onClose(); }
-    void onClear(CCObject*)   { fw::actionClear(); this->onClose(); }
+    void onRecord(CCObject*)  { if (fw::actionRecord(m_pause))  this->onClose(nullptr); }
+    void onReplay(CCObject*)  { if (fw::actionReplay(m_pause))  this->onClose(nullptr); }
+    void onAnalyze(CCObject*) { if (fw::actionAnalyze(m_pause)) this->onClose(nullptr); }
+    void onClear(CCObject*)   { fw::actionClear(); this->onClose(nullptr); }
 };
 
 // ------------------------------------------------------------------ pause menu button
