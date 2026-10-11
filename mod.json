@@ -9,7 +9,7 @@
   "name": "Frame Window Counter",
   "version": "v0.1.0",
   "developer": "The5xcuber",
-  "description": "Record a run at 240 TPS, then scan every click (any gamemode, any button, P1 and P2) to count how many frames it could be shifted and still pass. Open the pause menu for Record, Replay, Analyze and Clear.",
+  "description": "Record a run at 240 TPS (normal or practice mode), then scan every click (any gamemode, any button, P1 and P2) to count how many frames it could be shifted and still pass. Open the pause menu and press Frame Window.",
   "settings": {
     "scan-range": {
       "type": "int",
@@ -25,12 +25,18 @@
       "description": "On: a shifted click passes if you are still alive a bit after the next click (fast). Off: the whole level must be completed for every trial (exact, but very slow on long levels).",
       "default": true
     },
+    "fast-scan": {
+      "type": "bool",
+      "name": "Fast scan",
+      "description": "Jump to a snapshot just before each click instead of replaying from 0% every trial. Much faster. If snapshots do not match the real run, the scan switches itself back to full replays.",
+      "default": true
+    },
     "check-horizon": {
       "type": "int",
       "name": "Local check length",
-      "description": "Ticks (at 240 TPS) you must stay alive after the next click for a local check to pass.",
+      "description": "Ticks (at 240 TPS) you must stay alive after the next click for a local check to pass. 0 means the trial ends exactly when the next click happens.",
       "default": 90,
-      "min": 10,
+      "min": 0,
       "max": 2400
     },
     "scan-budget-ms": {
