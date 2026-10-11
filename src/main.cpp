@@ -12,12 +12,14 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/ui/Popup.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cmath>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -44,6 +46,9 @@ namespace fw {
     inline size_t replayIdx = 0;
     inline bool injecting = false;       // true only while WE call handleButton
     inline bool inStep = false;          // true while the scan steps one tick
+    inline int lastSeenTick = 0;         // last physics tick seen while recording
+    inline bool warnedRollback = false;  // one time warning per recording
+    inline int lastRewindTick = -1;      // tick of the last checkpoint rewind (hooks can fire twice)
     inline int rowCounts[16] = {};
 
     // If replayed clicks land one tick early or late compared to your recording,
@@ -166,7 +171,7 @@ namespace fw {
 
     struct Scan {
         int ci = -1;              // -1 = baseline run, then 0..N-1
-        int phase = 1;            // 1 = shifting earlier, 2 = shifting later
+        int phase = 0;            // 0 = sanity check (shift 0), 1 = earlier, 2 = later
         int shift = 0;
         int lo = 0, hi = 0;
         bool capLo = false, capHi = false;
@@ -180,15 +185,59 @@ namespace fw {
         int noProgress = 0;
         int trials = 0;
 
+        // Fast scan: instead of replaying from 0% for every trial, jump to a snapshot taken
+        // just before the click under test, and only simulate from there.
+        bool fast = true;
+        bool fastFellBack = false;     // snapshots did not behave, full replays were used instead
+        bool useSnap = false;
+        CheckpointObject* snap = nullptr;
+        int snapTick = 0;
+        bool needAdvance = false;      // move the snapshot forward to the next click
+        bool advancing = false;
+        int advanceTarget = 0;
+
         bool localCheck = true;
         int horizon = 90;
         int range = 12;
         int savedAttempts = 0;
         bool aborted = false;
-        bool lateInject = false;   // a click was injected after its tick had passed
+        bool cancel = false;
+        bool lateInject = false;       // a click was injected after its tick had passed
         std::string error;
     };
     inline Scan S;
+
+    // Tick the snapshot for click i is taken at: earlier than the earliest shifted position.
+    inline int snapTickFor(int i) {
+        return std::max(0, macro[i].tick - S.range - 1);
+    }
+
+    inline void dropSnap() {
+        if (S.snap) { S.snap->release(); S.snap = nullptr; }
+    }
+
+    inline bool takeSnap(PlayLayer* pl) {
+        auto cp = pl->createCheckpoint();
+        if (!cp) return false;
+        cp->retain();
+        dropSnap();
+        S.snap = cp;
+        S.snapTick = pl->m_gameState.m_currentProgress;
+        return true;
+    }
+
+    inline void fallBack() {
+        S.fast = false;
+        S.useSnap = false;
+        S.needAdvance = false;
+        S.fastFellBack = true;
+    }
+
+    inline size_t firstIdxAtOrAfter(int tick) {
+        size_t i = 0;
+        while (i < S.ev.size() && S.ev[i].tick < tick) i++;
+        return i;
+    }
 
     // Builds the event list for one trial. Returns false if the shift is impossible
     // (negative tick, or it would jump over the same button's neighbouring event).
@@ -229,25 +278,49 @@ namespace fw {
     }
 
     inline void startClick() {
-        S.phase = 1; S.shift = -1; S.lo = S.hi = 0; S.capLo = S.capHi = false;
+        S.phase = 0; S.shift = 0; S.lo = S.hi = 0; S.capLo = S.capHi = false;
+        S.useSnap = S.fast && S.snap != nullptr;
+    }
+
+    // Called when S.ci just changed to a new click.
+    inline void enterClick() {
+        if (S.ci >= (int)macro.size()) return;
+        startClick();
+        if (S.fast && S.snap) {
+            int nt = snapTickFor(S.ci);
+            if (nt != S.snapTick) { S.needAdvance = true; S.advanceTarget = nt; }
+        }
     }
 
     inline void finishClick() {
         widths[S.ci] = S.hi - S.lo + 1;
         capped[S.ci] = (S.capLo || S.capHi) ? 1 : 0;
         S.ci++;
-        if (S.ci < (int)macro.size()) startClick();
+        enterClick();
+    }
+
+    inline void skipClick() {
+        S.ci++;
+        enterClick();
     }
 
     inline void advance(bool pass) {
         if (S.ci < 0) {
             if (!pass) {
                 S.aborted = true;
-                S.error = "The unmodified recording does not finish the level. Record a completed run first.";
+                S.error = "The unmodified recording does not finish the level in a normal run. "
+                          "If you recorded in practice mode, the checkpoint respawns did not reproduce exactly. "
+                          "Re-record and place checkpoints while no button is held and the player is on stable ground.";
                 return;
             }
             S.ci = 0;
-            if (!macro.empty()) startClick();
+            if (!macro.empty()) enterClick();
+            return;
+        }
+        if (S.phase == 0) {
+            if (pass) { S.phase = 1; S.shift = -1; return; }
+            if (S.useSnap) { fallBack(); return; }   // snapshot did not reproduce the run, retry with a full replay
+            skipClick();                             // even a full replay fails, leave this click unscanned
             return;
         }
         if (S.phase == 1) {
@@ -283,6 +356,7 @@ namespace fw {
         }
         if (unknown) out += fmt::format("not scanned: {}\n", unknown);
         out += fmt::format("trials run: {}", S.trials);
+        if (S.fastFellBack) out += "\nFast scan was switched off partway (snapshots did not match), the rest used full replays.";
         return out;
     }
 
@@ -295,38 +369,56 @@ namespace fw {
     inline void updateProgress() {
         auto scene = CCDirector::get()->getRunningScene();
         if (!scene) return;
-        auto l = typeinfo_cast<CCLabelBMFont*>(scene->getChildByTag(kProgressTag));
+        auto hud = scene->getChildByTag(kProgressTag);
+        if (!hud) return;
+        auto l = typeinfo_cast<CCLabelBMFont*>(hud->getChildByTag(1));
         if (!l) return;
-        l->setString(fmt::format("Scanning click {}/{}  (trials: {})",
-            std::max(S.ci, 0) + 1, macro.size(), S.trials).c_str());
+        l->setString(fmt::format("Scanning click {}/{}  trials: {}{}",
+            std::max(S.ci, 0) + 1, macro.size(), S.trials, S.fast ? "  (fast)" : "").c_str());
     }
 
     inline void beginScan(PlayLayer* pl) {
+        dropSnap();
         S = Scan{};
         S.localCheck = opt<bool>("local-check");
         S.horizon = (int)opt<int64_t>("check-horizon");
         S.range = (int)opt<int64_t>("scan-range");
+        S.fast = opt<bool>("fast-scan");
         S.savedAttempts = pl->m_attempts;
         widths.assign(macro.size(), -1);
         capped.assign(macro.size(), 0);
 
-        mode = Mode::Scanning;
-        pl->setVisible(false);
+        mode = Mode::Scanning;   // the level stays visible so you can watch it being scanned
 
         auto scene = CCDirector::get()->getRunningScene();
         auto win = CCDirector::get()->getWinSize();
+        auto hud = CCNode::create();
+        hud->setTag(kProgressTag);
+
         auto l = CCLabelBMFont::create("Scanning...", "bigFont.fnt");
-        l->setScale(0.6f);
-        l->setPosition({win.width / 2.f, win.height / 2.f});
-        l->setTag(kProgressTag);
-        scene->addChild(l, 9999);
+        l->setScale(0.4f);
+        l->setTag(1);
+        l->setPosition({win.width / 2.f, win.height - 18.f});
+        hud->addChild(l);
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        auto spr = ButtonSprite::create("Cancel", "bigFont.fnt", "GJ_button_06.png", 0.5f);
+        auto btn = CCMenuItemExt::createSpriteExtra(spr, [](CCMenuItemSpriteExtra*) {
+            S.cancel = true;
+        });
+        btn->setPosition({win.width / 2.f, win.height - 46.f});
+        menu->addChild(btn);
+        hud->addChild(menu);
+
+        scene->addChild(hud, 9999);
     }
 
     inline void endScan(PlayLayer* pl, bool ok) {
         mode = Mode::Idle;
         inStep = false;
         removeProgress();
-        pl->setVisible(true);
+        dropSnap();
         pl->m_attempts = S.savedAttempts;
         pl->resetLevel();
         resetCounter(pl);
@@ -336,6 +428,47 @@ namespace fw {
         } else {
             FLAlertLayer::create("Scan stopped",
                 S.error.empty() ? "Unknown error." : S.error.c_str(), "OK")->show();
+        }
+    }
+
+    // Starts a trial: from the snapshot if there is one, otherwise from 0%.
+    inline void beginTrial(PlayLayer* pl) {
+        S.died = S.finished = false;
+        S.noProgress = 0;
+        S.trialActive = true;
+        S.trials++;
+        if (S.fast && S.useSnap && S.snap) {
+            pl->loadFromCheckpoint(S.snap);
+            if (pl->m_gameState.m_currentProgress == S.snapTick) {
+                S.idx = firstIdxAtOrAfter(S.snapTick);
+                return;
+            }
+            fallBack();   // the checkpoint did not bring the tick counter back
+        }
+        pl->resetLevel();
+        S.idx = 0;
+    }
+
+    // Plays the unmodified run forward from the current snapshot to the next click's snapshot tick.
+    inline void beginAdvance(PlayLayer* pl) {
+        S.ev = macro;
+        S.passTick = INT_MAX;
+        S.hardStop = macro.back().tick + 2400;
+        S.died = S.finished = false;
+        S.noProgress = 0;
+        S.needAdvance = false;
+        pl->loadFromCheckpoint(S.snap);
+        if (pl->m_gameState.m_currentProgress != S.snapTick) { fallBack(); return; }
+        S.idx = firstIdxAtOrAfter(S.snapTick);
+        S.trialActive = true;
+        S.advancing = true;
+    }
+
+    // During the baseline run, grab the first snapshot when its tick is reached.
+    inline void baselineSnap(PlayLayer* pl) {
+        if (!S.fast || S.snap || S.ci >= 0 || macro.empty()) return;
+        if (pl->m_gameState.m_currentProgress >= snapTickFor(0)) {
+            if (!takeSnap(pl)) fallBack();
         }
     }
 
@@ -349,17 +482,16 @@ namespace fw {
         };
 
         while (std::chrono::steady_clock::now() - start < budget) {
+            if (S.cancel) { S.error = "Scan cancelled."; endScan(pl, false); return; }
             if (S.aborted) { endScan(pl, false); return; }
 
             if (!S.trialActive) {
                 if (S.ci >= (int)macro.size()) { endScan(pl, true); return; }
+                if (S.needAdvance && S.fast && S.snap) { beginAdvance(pl); continue; }
+                S.needAdvance = false;
                 if (!buildTrial(S.ci, S.shift)) { advance(false); continue; }
-                S.died = S.finished = false;
-                S.idx = 0;
-                S.noProgress = 0;
-                S.trialActive = true;
-                S.trials++;
-                pl->resetLevel();
+                beginTrial(pl);
+                baselineSnap(pl);
             }
 
             int before = pl->m_gameState.m_currentProgress;
@@ -391,7 +523,24 @@ namespace fw {
                 S.noProgress = 0;
             }
 
-            if (S.died || (pl->m_player1 && pl->m_player1->m_isDead)) { conclude(false); continue; }
+            bool dead = S.died || (pl->m_player1 && pl->m_player1->m_isDead);
+
+            if (S.advancing) {
+                if (dead || S.finished || tick > S.hardStop) {
+                    S.advancing = false; S.trialActive = false;
+                    fallBack();
+                    continue;
+                }
+                if (tick >= S.advanceTarget) {
+                    S.advancing = false; S.trialActive = false;
+                    if (!takeSnap(pl)) fallBack();
+                }
+                continue;
+            }
+
+            baselineSnap(pl);
+
+            if (dead) { conclude(false); continue; }
             if (S.finished) { conclude(true); continue; }
             if (S.localCheck && S.ci >= 0 && tick >= S.passTick) { conclude(true); continue; }
             if (tick > S.hardStop) { conclude(false); continue; }
@@ -399,15 +548,75 @@ namespace fw {
         updateProgress();
     }
 
-    inline void finishRecording() {
+    inline void finishRecording(PlayLayer* pl) {
         mode = Mode::Idle;
         widths.assign(macro.size(), -1);
         capped.assign(macro.size(), 0);
         save();
+        bool practice = pl && pl->m_isPracticeMode;
         Notification::create(
-            fmt::format("Recorded {} inputs. Open pause, then Analyze.", macro.size()),
+            fmt::format("Recorded {} inputs. {}", macro.size(),
+                practice ? "Exit practice mode, then Analyze." : "Open pause, then Analyze."),
             NotificationIcon::Success
         )->show();
+    }
+
+    inline void renumber() {
+        for (size_t i = 0; i < macro.size(); i++) macro[i].id = (int)i;
+    }
+
+    // Practice mode support. When a checkpoint is loaded the game rewinds its tick counter
+    // (the checkpoint stores a whole GJGameState), so every recorded event from the attempt
+    // that just died is thrown away. That leaves one continuous 0% to end input list.
+    // Held buttons are then reconciled with what the game says is held after the respawn,
+    // so the list stays correct even if a button was down when the checkpoint was made.
+    inline void rewindRecording(PlayLayer* pl) {
+        if (mode != Mode::Recording || !pl) return;
+        int T = pl->m_gameState.m_currentProgress;
+
+        if (T != lastRewindTick && lastSeenTick > 0 && T >= lastSeenTick && !warnedRollback) {
+            warnedRollback = true;
+            Notification::create(
+                "Tick counter did not roll back on checkpoint load. Practice recording may desync.",
+                NotificationIcon::Warning
+            )->show();
+        }
+
+        macro.erase(std::remove_if(macro.begin(), macro.end(),
+            [T](Click const& c) { return c.tick >= T; }), macro.end());
+
+        // what the recording thinks is held right now
+        std::map<std::pair<int, bool>, bool> held;
+        for (auto& c : macro) held[{c.button, c.p1}] = c.down;
+
+        auto reconcile = [&](PlayerObject* plr, bool p1) {
+            if (!plr) return;
+            std::vector<Click> extra;
+            for (auto& [key, down] : held) {
+                if (key.second != p1) continue;
+                bool game = false;
+                auto it = plr->m_holdingButtons.find(key.first);
+                if (it != plr->m_holdingButtons.end()) game = it->second;
+                if (down != game) {
+                    Click c; c.tick = T; c.button = key.first; c.down = game; c.p1 = p1;
+                    extra.push_back(c);
+                }
+            }
+            for (auto& [btn, game] : plr->m_holdingButtons) {
+                if (game && !held.count({btn, p1})) {
+                    Click c; c.tick = T; c.button = btn; c.down = true; c.p1 = p1;
+                    extra.push_back(c);
+                }
+            }
+            for (auto& c : extra) macro.push_back(c);
+        };
+        reconcile(pl->m_player1, true);
+        reconcile(pl->m_player2, false);
+
+        renumber();
+        widths.clear();
+        capped.clear();
+        lastRewindTick = T;
     }
 
     inline void resetState() {
@@ -447,6 +656,9 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = typeinfo_cast<PlayLayer*>(this);
+        if (pl && fw::mode == fw::Mode::Recording) {
+            fw::lastSeenTick = m_gameState.m_currentProgress;
+        }
         if (pl && (fw::mode == fw::Mode::Replaying || fw::mode == fw::Mode::Scanning)) {
             bool scanning = fw::mode == fw::Mode::Scanning;
             auto& ev = scanning ? fw::S.ev : fw::macro;
@@ -473,15 +685,27 @@ class $modify(FWPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         if (fw::mode == fw::Mode::Recording) {
-            // only the final attempt is kept
-            fw::macro.clear();
-            fw::widths.clear();
-            fw::capped.clear();
+            bool hasCheckpoints = m_isPracticeMode && m_checkpointArray && m_checkpointArray->count() > 0;
+            if (hasCheckpoints) {
+                // respawned at a checkpoint: keep everything before it
+                fw::rewindRecording(this);
+            } else {
+                // respawned at 0%: only the final attempt is kept
+                fw::macro.clear();
+                fw::widths.clear();
+                fw::capped.clear();
+                fw::lastSeenTick = 0;
+            }
         }
         if (fw::mode == fw::Mode::Replaying) {
             fw::replayIdx = 0;
             fw::resetCounter(this);
         }
+    }
+
+    void loadFromCheckpoint(CheckpointObject* cp) {
+        PlayLayer::loadFromCheckpoint(cp);
+        fw::rewindRecording(this);
     }
 
     void update(float dt) {
@@ -505,7 +729,7 @@ class $modify(FWPlayLayer, PlayLayer) {
             fw::S.finished = true;
             return;
         }
-        if (fw::mode == fw::Mode::Recording) fw::finishRecording();
+        if (fw::mode == fw::Mode::Recording) fw::finishRecording(this);
         else if (fw::mode == fw::Mode::Replaying) fw::mode = fw::Mode::Idle;
         PlayLayer::levelComplete();
     }
@@ -521,7 +745,126 @@ class $modify(FWPlayLayer, PlayLayer) {
     }
 };
 
-// ------------------------------------------------------------------ pause menu
+// ------------------------------------------------------------------ menu actions
+
+namespace fw {
+
+    // Replay and Analyze must start from 0% in a normal run, so practice mode has to be off.
+    // The recording is kept in memory and on disk, so toggling practice off loses nothing.
+    inline bool needNormalMode(PlayLayer* pl) {
+        if (!pl) return false;
+        if (pl->m_isPracticeMode) {
+            FLAlertLayer::create("Frame Window",
+                "Exit practice mode first (pause menu, then the practice toggle), then press this again. "
+                "Your recording is kept.", "OK")->show();
+            return false;
+        }
+        return true;
+    }
+
+    // Each action returns true if it started and the pause menu was closed.
+
+    inline bool actionRecord(PauseLayer* pause) {
+        auto pl = PlayLayer::get();
+        if (!pl) return false;
+        macro.clear(); widths.clear(); capped.clear();
+        lastSeenTick = 0;
+        lastRewindTick = -1;
+        warnedRollback = false;
+        mode = Mode::Recording;
+        // works in normal and practice mode: always start a fresh run from 0%
+        pl->resetLevelFromStart();
+        if (pl->m_gameState.m_currentProgress != 0) {
+            // a recording that does not begin at tick 0 can never be replayed from 0%
+            mode = Mode::Idle;
+            FLAlertLayer::create("Frame Window",
+                "Could not restart from 0%. Delete your checkpoints or restart the level, then press Record again.",
+                "OK")->show();
+            return false;
+        }
+        pause->onResume(nullptr);
+        return true;
+    }
+
+    inline bool actionReplay(PauseLayer* pause) {
+        auto pl = PlayLayer::get();
+        if (!needNormalMode(pl)) return false;
+        if (macro.empty()) {
+            FLAlertLayer::create("Frame Window", "Nothing recorded yet.", "OK")->show();
+            return false;
+        }
+        mode = Mode::Replaying;
+        pause->onRestart(nullptr);
+        return true;
+    }
+
+    inline bool actionAnalyze(PauseLayer* pause) {
+        auto pl = PlayLayer::get();
+        if (!needNormalMode(pl)) return false;
+        if (macro.empty()) {
+            FLAlertLayer::create("Frame Window", "Nothing recorded yet.", "OK")->show();
+            return false;
+        }
+        beginScan(pl);
+        pause->onResume(nullptr);
+        return true;
+    }
+
+    inline void actionClear() {
+        clearAll();
+        Notification::create("Recording cleared", NotificationIcon::Success)->show();
+    }
+
+} // namespace fw
+
+// ------------------------------------------------------------------ menu popup
+
+class FWMenuPopup : public geode::Popup {
+protected:
+    PauseLayer* m_pause = nullptr;
+
+    bool init(PauseLayer* pause) {
+        if (!Popup::init(300.f, 200.f)) return false;
+        m_pause = pause;
+        this->setTitle("Frame Window");
+
+        auto addBtn = [&](char const* text, SEL_MenuHandler sel, CCPoint pos) {
+            auto spr = ButtonSprite::create(text, "bigFont.fnt", "GJ_button_04.png", 0.7f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
+            m_buttonMenu->addChildAtPosition(btn, Anchor::Center, pos);
+        };
+        addBtn("Record",  menu_selector(FWMenuPopup::onRecord),  {-75.f, 25.f});
+        addBtn("Replay",  menu_selector(FWMenuPopup::onReplay),  { 75.f, 25.f});
+        addBtn("Analyze", menu_selector(FWMenuPopup::onAnalyze), {-75.f, -20.f});
+        addBtn("Clear",   menu_selector(FWMenuPopup::onClear),   { 75.f, -20.f});
+
+        int scanned = 0;
+        for (int w : fw::widths) if (w >= 0) scanned++;
+        auto status = CCLabelBMFont::create(
+            fmt::format("Recorded inputs: {}   Scanned: {}", fw::macro.size(), scanned).c_str(),
+            "chatFont.fnt");
+        m_mainLayer->addChildAtPosition(status, Anchor::Bottom, {0.f, 28.f});
+        return true;
+    }
+
+public:
+    static FWMenuPopup* create(PauseLayer* pause) {
+        auto ret = new FWMenuPopup();
+        if (ret->init(pause)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    void onRecord(CCObject*)  { if (fw::actionRecord(m_pause))  this->onClose(); }
+    void onReplay(CCObject*)  { if (fw::actionReplay(m_pause))  this->onClose(); }
+    void onAnalyze(CCObject*) { if (fw::actionAnalyze(m_pause)) this->onClose(); }
+    void onClear(CCObject*)   { fw::actionClear(); this->onClose(); }
+};
+
+// ------------------------------------------------------------------ pause menu button
 
 class $modify(FWPause, PauseLayer) {
     void customSetup() {
@@ -532,61 +875,14 @@ class $modify(FWPause, PauseLayer) {
         menu->setID("the5xcuber.framewindow/menu");
         menu->setPosition({0.f, 0.f});
 
-        auto add = [&](char const* text, SEL_MenuHandler sel, float y) {
-            auto spr = ButtonSprite::create(text, "bigFont.fnt", "GJ_button_04.png", 0.7f);
-            auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
-            btn->setPosition({win.width - 70.f, y});
-            menu->addChild(btn);
-        };
-        float y = win.height / 2.f + 70.f;
-        add("Record",  menu_selector(FWPause::onFWRecord),  y);
-        add("Replay",  menu_selector(FWPause::onFWReplay),  y - 40.f);
-        add("Analyze", menu_selector(FWPause::onFWAnalyze), y - 80.f);
-        add("Clear",   menu_selector(FWPause::onFWClear),   y - 120.f);
+        auto spr = ButtonSprite::create("Frame Window", "bigFont.fnt", "GJ_button_04.png", 0.6f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(FWPause::onFWMenu));
+        btn->setPosition({win.width - 85.f, win.height / 2.f});
+        menu->addChild(btn);
         this->addChild(menu);
     }
 
-    bool fwAllowed(PlayLayer* pl) {
-        if (!pl) return false;
-        if (pl->m_isPracticeMode) {
-            FLAlertLayer::create("Frame Window", "Turn practice mode off first. Runs must start at 0%.", "OK")->show();
-            return false;
-        }
-        return true;
-    }
-
-    void onFWRecord(CCObject* sender) {
-        auto pl = PlayLayer::get();
-        if (!fwAllowed(pl)) return;
-        fw::macro.clear(); fw::widths.clear(); fw::capped.clear();
-        fw::mode = fw::Mode::Recording;
-        this->onRestart(sender);
-    }
-
-    void onFWReplay(CCObject* sender) {
-        auto pl = PlayLayer::get();
-        if (!fwAllowed(pl)) return;
-        if (fw::macro.empty()) {
-            FLAlertLayer::create("Frame Window", "Nothing recorded yet.", "OK")->show();
-            return;
-        }
-        fw::mode = fw::Mode::Replaying;
-        this->onRestart(sender);
-    }
-
-    void onFWAnalyze(CCObject* sender) {
-        auto pl = PlayLayer::get();
-        if (!fwAllowed(pl)) return;
-        if (fw::macro.empty()) {
-            FLAlertLayer::create("Frame Window", "Nothing recorded yet.", "OK")->show();
-            return;
-        }
-        fw::beginScan(pl);
-        this->onResume(sender);
-    }
-
-    void onFWClear(CCObject*) {
-        fw::clearAll();
-        Notification::create("Recording cleared", NotificationIcon::Success)->show();
+    void onFWMenu(CCObject*) {
+        if (auto popup = FWMenuPopup::create(this)) popup->show();
     }
 };
