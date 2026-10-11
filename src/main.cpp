@@ -50,6 +50,7 @@ namespace fw {
     inline bool warnedRollback = false;  // one time warning per recording
     inline int lastRewindTick = -1;      // tick of the last checkpoint rewind (hooks can fire twice)
     inline int rowCounts[16] = {};
+    inline std::map<std::pair<int, bool>, bool> heldNow;   // what the recording thinks is held
 
     // If replayed clicks land one tick early or late compared to your recording,
     // change this to -1 or 1.
@@ -616,6 +617,8 @@ namespace fw {
         renumber();
         widths.clear();
         capped.clear();
+        heldNow.clear();
+        for (auto& c : macro) heldNow[{c.button, c.p1}] = c.down;
         lastRewindTick = T;
     }
 
@@ -642,13 +645,20 @@ class $modify(FWBaseLayer, GJBaseGameLayer) {
             if (!fw::injecting && (fw::mode == fw::Mode::Replaying || fw::mode == fw::Mode::Scanning)) return;
 
             if (!fw::injecting && fw::mode == fw::Mode::Recording) {
-                fw::Click c;
-                c.id = (int)fw::macro.size();
-                c.tick = m_gameState.m_currentProgress + fw::kTickOffset;
-                c.button = button;
-                c.down = down;
-                c.p1 = isPlayer1;
-                fw::macro.push_back(c);
+                // only real state changes are recorded: a release while nothing is held
+                // (or a second press) is noise from the game and is dropped
+                auto key = std::make_pair(button, isPlayer1);
+                bool cur = fw::heldNow[key];
+                if (down != cur) {
+                    fw::heldNow[key] = down;
+                    fw::Click c;
+                    c.id = (int)fw::macro.size();
+                    c.tick = m_gameState.m_currentProgress + fw::kTickOffset;
+                    c.button = button;
+                    c.down = down;
+                    c.p1 = isPlayer1;
+                    fw::macro.push_back(c);
+                }
             }
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
@@ -694,6 +704,7 @@ class $modify(FWPlayLayer, PlayLayer) {
                 fw::macro.clear();
                 fw::widths.clear();
                 fw::capped.clear();
+                fw::heldNow.clear();
                 fw::lastSeenTick = 0;
             }
         }
@@ -722,6 +733,18 @@ class $modify(FWPlayLayer, PlayLayer) {
             return;
         }
         PlayLayer::destroyPlayer(player, object);
+    }
+
+    // Reached the end wall. Everything the game does after this (the animation, auto releases)
+    // is not part of the run, and during a scan the real time animation must be skipped or the
+    // trial would wait for it forever.
+    void playEndAnimationToPos(CCPoint position) {
+        if (fw::mode == fw::Mode::Scanning) {
+            fw::S.finished = true;
+            return;
+        }
+        if (fw::mode == fw::Mode::Recording) fw::finishRecording(this);
+        PlayLayer::playEndAnimationToPos(position);
     }
 
     void levelComplete() {
@@ -768,6 +791,7 @@ namespace fw {
         auto pl = PlayLayer::get();
         if (!pl) return false;
         macro.clear(); widths.clear(); capped.clear();
+        heldNow.clear();
         lastSeenTick = 0;
         lastRewindTick = -1;
         warnedRollback = false;
@@ -824,7 +848,7 @@ protected:
     PauseLayer* m_pause = nullptr;
 
     bool init(PauseLayer* pause) {
-        if (!Popup::init(300.f, 200.f)) return false;
+        if (!Popup::init(300.f, 220.f)) return false;
         m_pause = pause;
         this->setTitle("Frame Window");
 
@@ -833,17 +857,18 @@ protected:
             auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
             m_buttonMenu->addChildAtPosition(btn, Anchor::Center, pos);
         };
-        addBtn("Record",  menu_selector(FWMenuPopup::onRecord),  {-75.f, 25.f});
-        addBtn("Replay",  menu_selector(FWMenuPopup::onReplay),  { 75.f, 25.f});
-        addBtn("Analyze", menu_selector(FWMenuPopup::onAnalyze), {-75.f, -20.f});
-        addBtn("Clear",   menu_selector(FWMenuPopup::onClear),   { 75.f, -20.f});
+        addBtn("Record",  menu_selector(FWMenuPopup::onRecord),  {-75.f, 40.f});
+        addBtn("Replay",  menu_selector(FWMenuPopup::onReplay),  { 75.f, 40.f});
+        addBtn("Analyze", menu_selector(FWMenuPopup::onAnalyze), {-75.f, 0.f});
+        addBtn("Clear",   menu_selector(FWMenuPopup::onClear),   { 75.f, 0.f});
+        addBtn("Inputs",  menu_selector(FWMenuPopup::onInputs),  { 0.f, -40.f});
 
         int scanned = 0;
         for (int w : fw::widths) if (w >= 0) scanned++;
         auto status = CCLabelBMFont::create(
             fmt::format("Recorded inputs: {}   Scanned: {}", fw::macro.size(), scanned).c_str(),
             "chatFont.fnt");
-        m_mainLayer->addChildAtPosition(status, Anchor::Bottom, {0.f, 28.f});
+        m_mainLayer->addChildAtPosition(status, Anchor::Bottom, {0.f, 22.f});
         return true;
     }
 
@@ -862,6 +887,23 @@ public:
     void onReplay(CCObject*)  { if (fw::actionReplay(m_pause))  this->onClose(nullptr); }
     void onAnalyze(CCObject*) { if (fw::actionAnalyze(m_pause)) this->onClose(nullptr); }
     void onClear(CCObject*)   { fw::actionClear(); this->onClose(nullptr); }
+
+    // Lists the recorded inputs so you can check that they match what you actually pressed.
+    void onInputs(CCObject*) {
+        if (fw::macro.empty()) {
+            FLAlertLayer::create("Recorded inputs", "Nothing recorded yet.", "OK")->show();
+            return;
+        }
+        std::string text;
+        size_t n = std::min<size_t>(fw::macro.size(), 14);
+        for (size_t i = 0; i < n; i++) {
+            auto& c = fw::macro[i];
+            char const* name = c.button == 1 ? "jump" : c.button == 2 ? "left" : c.button == 3 ? "right" : "other";
+            text += fmt::format("tick {}   P{} {} {}\n", c.tick, c.p1 ? 1 : 2, name, c.down ? "down" : "up");
+        }
+        if (fw::macro.size() > n) text += fmt::format("... and {} more", fw::macro.size() - n);
+        FLAlertLayer::create("Recorded inputs", text.c_str(), "OK")->show();
+    }
 };
 
 // ------------------------------------------------------------------ pause menu button
