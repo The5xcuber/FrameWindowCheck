@@ -1,78 +1,117 @@
 {
-  "geode": "5.10.1",
+  "geode": "5.0.0",
   "gd": {
     "win": "2.2081",
-    "mac": "2.2081",
     "android": "2.2081"
   },
-  "id": "the5xcuber.framewindow",
-  "name": "Frame Window Counter",
   "version": "v0.1.0",
+  "id": "yourname.framewindow",
+  "name": "Frame Window Counter",
   "developer": "The5xcuber",
-  "description": "Record a run at 240 TPS (normal or practice mode), then scan every click (any gamemode, any button, P1 and P2) to count how many frames it could be shifted and still pass. Open the pause menu and press Frame Window.",
+  "description": "Measures how many 240 TPS frames each click in a macro can be shifted by while the player still survives.",
   "settings": {
-    "scan-range": {
+    "max-frames": {
+      "name": "Max frames to check",
+      "description": "How many frames before and after each click are tested (1 to 25).",
       "type": "int",
-      "name": "Scan range",
-      "description": "How many ticks each click is shifted to each side before the scan stops and shows a plus sign. Higher is slower.",
       "default": 12,
-      "min": 2,
-      "max": 60
-    },
-    "local-check": {
-      "type": "bool",
-      "name": "Local check",
-      "description": "On: a shifted click passes if you are still alive a bit after the next click (fast). Off: the whole level must be completed for every trial (exact, but very slow on long levels).",
-      "default": true
-    },
-    "fast-scan": {
-      "type": "bool",
-      "name": "Fast scan",
-      "description": "Jump to a snapshot just before each click instead of replaying from 0% every trial. Much faster. If snapshots do not match the real run, the scan switches itself back to full replays.",
-      "default": true
-    },
-    "check-horizon": {
-      "type": "int",
-      "name": "Local check length",
-      "description": "Ticks (at 240 TPS) you must stay alive after the next click for a local check to pass. 0 means the trial ends exactly when the next click happens.",
-      "default": 90,
-      "min": 0,
-      "max": 2400
-    },
-    "scan-budget-ms": {
-      "type": "int",
-      "name": "Scan time per frame (ms)",
-      "description": "How long the scan may work each rendered frame. Higher scans faster but the game stutters more.",
-      "default": 8,
       "min": 1,
-      "max": 50
+      "max": 25
     },
-    "count-fps": {
+    "use-custom-survival": {
+      "name": "Use custom frame survival",
+      "description": "If off, a shifted click must survive until the next original click. If on, it must survive the number of frames set below.",
+      "type": "bool",
+      "default": false
+    },
+    "custom-survival-frames": {
+      "name": "Custom survival frames",
       "type": "int",
-      "name": "Count frames at FPS",
-      "description": "240 counts physics ticks. 120 or 60 divides the windows so a 4 tick window shows as 1 frame at 60.",
-      "default": 240,
-      "min": 60,
+      "default": 12,
+      "min": 1,
       "max": 240
     },
-    "counter-max": {
+    "full-scan": {
+      "name": "Full scan",
+      "description": "Test every offset even after a failure. Slower, but the result file lists every offset. The window size is the same either way.",
+      "type": "bool",
+      "default": false
+    },
+    "extra-export": {
+      "name": "Extra results export",
+      "description": "JSON is always saved (Replay reads it). This adds a second file.",
+      "type": "string",
+      "default": "None",
+      "one-of": [
+        "None",
+        "CSV",
+        "TXT"
+      ]
+    },
+    "analysis-budget-ms": {
+      "name": "Analysis time per frame (ms)",
+      "description": "How long each rendered frame is spent simulating. Higher is faster but the game looks choppier.",
       "type": "int",
-      "name": "Counter rows",
-      "description": "Number of counter rows. The last row counts that many frames or more (for 5, the row is 5+).",
-      "default": 5,
+      "default": 12,
       "min": 2,
-      "max": 10
+      "max": 40
     },
-    "show-counter": {
-      "type": "bool",
-      "name": "Show counter",
-      "default": true
+    "overlay-x": {
+      "name": "Overlay X (px)",
+      "type": "float",
+      "default": 8.0,
+      "min": 0.0,
+      "max": 400.0
     },
-    "show-circles": {
+    "overlay-y-percent": {
+      "name": "Overlay Y (% of screen height)",
+      "type": "float",
+      "default": 50.0,
+      "min": 5.0,
+      "max": 95.0
+    },
+    "overlay-scale": {
+      "name": "Overlay scale",
+      "type": "float",
+      "default": 0.6,
+      "min": 0.3,
+      "max": 1.5
+    },
+    "overlay-opacity": {
+      "name": "Overlay opacity",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.1,
+      "max": 1.0
+    },
+    "skip-tps-check": {
+      "name": "Skip TPS check",
+      "description": "Only turn this on if the mod wrongly says your TPS is not 240. Results are only valid at vanilla 240 TPS.",
       "type": "bool",
-      "name": "Show click numbers",
-      "description": "Floats each click's frame window next to the icon during replay.",
-      "default": true
+      "default": false
+    },
+    "input-offset": {
+      "name": "Input frame offset",
+      "description": "Shifts when Replay and Analyze feed the macro's clicks (presses), in frames. Try -1 or 1 if clicks land early or late. Redo Analyze after changing it.",
+      "type": "int",
+      "default": 0,
+      "min": -3,
+      "max": 3
+    },
+    "release-offset": {
+      "name": "Release frame offset",
+      "description": "Shifts only the button RELEASES when Replay and Analyze feed the macro, in frames. Try -1 or 1 if releases land early or late. Redo Analyze after changing it.",
+      "type": "int",
+      "default": 0,
+      "min": -3,
+      "max": 3
     }
-  }
+  },
+  "dependencies": [
+    {
+      "id": "geode.node-ids",
+      "version": "v1.22.0",
+      "importance": "required"
+    }
+  ]
 }
